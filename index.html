@@ -537,6 +537,40 @@
     throw lastErr;
   });
 
+  // ── Wallet provider discovery (EIP-6963) ──
+  // When several wallet extensions are installed (e.g. MetaMask + OKX/evmAsk +
+  // midenWallet) they fight over window.ethereum; one locks it as a getter and
+  // window.ethereum may NOT be MetaMask. GenLayer needs the MetaMask provider
+  // specifically (the snap lives there), so discover it explicitly via EIP-6963
+  // instead of trusting whoever won the global. Falls back to legacy shapes.
+  const _eip6963 = [];
+  if (typeof window !== "undefined") {
+    window.addEventListener("eip6963:announceProvider", (e) => {
+      try { if (e.detail && e.detail.provider) _eip6963.push(e.detail); } catch (_) {}
+    });
+    try { window.dispatchEvent(new Event("eip6963:requestProvider")); } catch (_) {}
+  }
+  let _mmProvider = null;
+  async function getMetaMaskProvider() {
+    if (_mmProvider) return _mmProvider;
+    // Re-request and give announcements a tick to land.
+    try { window.dispatchEvent(new Event("eip6963:requestProvider")); } catch (_) {}
+    await new Promise((r) => setTimeout(r, 80));
+    const mmDetail = _eip6963.find((d) => d.info && /io\.metamask/i.test(d.info.rdns || ""))
+                  || _eip6963.find((d) => d.info && /metamask/i.test(d.info.name || ""));
+    if (mmDetail) return (_mmProvider = mmDetail.provider);
+    const eth = window.ethereum;
+    // Legacy multi-wallet: window.ethereum.providers[] — pick MetaMask.
+    if (eth && Array.isArray(eth.providers)) {
+      const mm = eth.providers.find((p) => p && p.isMetaMask && !p.isBraveWallet && !p.isOkxWallet);
+      if (mm) return (_mmProvider = mm);
+    }
+    if (eth && eth.isMetaMask) return (_mmProvider = eth);
+    if (eth) return (_mmProvider = eth); // last resort: whatever injected
+    throw new Error("MetaMask not found — install or enable the MetaMask extension");
+  }
+  window.GL_getProvider = getMetaMaskProvider; // exposed for the app's reconnect
+
   // Some MetaMask + genlayer-js/viem combinations throw a RangeError
   // ("Maximum call stack size exceeded") while formatting an error against the
   // huge GenLayer chain ABI. Translate that noise into a clear, actionable msg.
@@ -554,7 +588,8 @@
   async function ensureWriteClient() {
     if (!account) throw new Error("not connected");
     if (!writeClient) {
-      writeClient = createClient({ chain: testnetAsimov, account, provider: window.ethereum });
+      const provider = await getMetaMaskProvider();
+      writeClient = createClient({ chain: testnetAsimov, account, provider });
     }
     // Adds the network if missing + installs the snap; harmless if already set.
     try { await writeClient.connect("testnetAsimov"); } catch (e) { /* already on chain / snap present */ }
@@ -566,10 +601,11 @@
     get account() { return account; },
 
     async connect() {
-      if (!window.ethereum) throw new Error("MetaMask not found");
+      // Use the MetaMask provider specifically (not whatever won window.ethereum).
+      const provider = await getMetaMaskProvider();
       // Connecting only needs the address — get it first so the dashboard can
       // always connect and read, even if the write-client/snap setup chokes.
-      const accs = await window.ethereum.request({ method: "eth_requestAccounts" });
+      const accs = await provider.request({ method: "eth_requestAccounts" });
       account = accs[0];
       // Best-effort write-client setup; never fatal to connect (writes build it
       // lazily via ensureWriteClient, so a hiccup here can't fail the connect).
@@ -678,15 +714,19 @@ whenReady(function(){
   // auto-reconnect if MetaMask already authorized. connect() loads the totals
   // itself, so only fetch them standalone when we're NOT reconnecting — this
   // avoids a duplicate burst of reads on refresh (which trips the RPC limit).
-  if (window.ethereum) {
-    window.ethereum.request({ method:'eth_accounts' }).then(function(accs){
+  // Resolve the MetaMask provider via EIP-6963 (multiple wallet extensions may
+  // be installed and fighting over window.ethereum).
+  const resolveProvider = window.GL_getProvider
+    ? window.GL_getProvider()
+    : Promise.resolve(window.ethereum || null);
+  resolveProvider.then(function(prov){
+    if (!prov) { loadTotals(); return; }
+    prov.request({ method:'eth_accounts' }).then(function(accs){
       if (accs && accs.length && localStorage.getItem('gb_addr')) connect();
       else loadTotals();
     }).catch(function(){ loadTotals(); });
-    window.ethereum.on && window.ethereum.on('accountsChanged', function(){ disconnect(); });
-  } else {
-    loadTotals();
-  }
+    prov.on && prov.on('accountsChanged', function(){ disconnect(); });
+  }).catch(function(){ loadTotals(); });
 });
 
 const msgInput = document.getElementById('msgInput');
