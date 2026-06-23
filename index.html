@@ -543,33 +543,56 @@
   // window.ethereum may NOT be MetaMask. GenLayer needs the MetaMask provider
   // specifically (the snap lives there), so discover it explicitly via EIP-6963
   // instead of trusting whoever won the global. Falls back to legacy shapes.
-  const _eip6963 = [];
+  const _eip6963 = new Map(); // rdns -> detail (dedup)
   if (typeof window !== "undefined") {
     window.addEventListener("eip6963:announceProvider", (e) => {
-      try { if (e.detail && e.detail.provider) _eip6963.push(e.detail); } catch (_) {}
+      try {
+        const d = e.detail;
+        if (d && d.provider && d.info) _eip6963.set(d.info.rdns || d.info.name, d);
+      } catch (_) {}
     });
     try { window.dispatchEvent(new Event("eip6963:requestProvider")); } catch (_) {}
+  }
+  const _isMM = (p) => p && p.isMetaMask && !p.isOkxWallet && !p.isBraveWallet && !p.isRabby && !p.overrideIsMetaMask;
+  // List every wallet we can see, for diagnostics + clearer errors.
+  function discoverWallets() {
+    const found = [];
+    for (const d of _eip6963.values()) found.push({ name: (d.info && d.info.name) || "?", rdns: (d.info && d.info.rdns) || "", provider: d.provider, src: "eip6963" });
+    const eth = window.ethereum;
+    if (eth && Array.isArray(eth.providers)) {
+      eth.providers.forEach((p) => found.push({ name: p.isMetaMask ? "MetaMask?" : (p.isOkxWallet ? "OKX" : "injected"), rdns: "", provider: p, src: "providers[]" }));
+    } else if (eth) {
+      found.push({ name: eth.isMetaMask ? "MetaMask?" : "injected", rdns: "", provider: eth, src: "window.ethereum" });
+    }
+    return found;
   }
   let _mmProvider = null;
   async function getMetaMaskProvider() {
     if (_mmProvider) return _mmProvider;
-    // Re-request and give announcements a tick to land.
-    try { window.dispatchEvent(new Event("eip6963:requestProvider")); } catch (_) {}
-    await new Promise((r) => setTimeout(r, 80));
-    const mmDetail = _eip6963.find((d) => d.info && /io\.metamask/i.test(d.info.rdns || ""))
-                  || _eip6963.find((d) => d.info && /metamask/i.test(d.info.name || ""));
-    if (mmDetail) return (_mmProvider = mmDetail.provider);
+    // Re-request a couple of times; some wallets announce late.
+    for (let i = 0; i < 3 && _eip6963.size === 0; i++) {
+      try { window.dispatchEvent(new Event("eip6963:requestProvider")); } catch (_) {}
+      await new Promise((r) => setTimeout(r, 120));
+    }
+    const wallets = discoverWallets();
+    console.log("[genote] wallets detected:", wallets.map((w) => w.name + (w.rdns ? " (" + w.rdns + ")" : "")));
+    // 1) Exact MetaMask via EIP-6963 rdns.
+    const byRdns = [..._eip6963.values()].find((d) => d.info && /io\.metamask/i.test(d.info.rdns || ""));
+    if (byRdns) return (_mmProvider = byRdns.provider);
+    // 2) Legacy providers[] flagged isMetaMask.
     const eth = window.ethereum;
-    // Legacy multi-wallet: window.ethereum.providers[] — pick MetaMask.
     if (eth && Array.isArray(eth.providers)) {
-      const mm = eth.providers.find((p) => p && p.isMetaMask && !p.isBraveWallet && !p.isOkxWallet);
+      const mm = eth.providers.find(_isMM);
       if (mm) return (_mmProvider = mm);
     }
-    if (eth && eth.isMetaMask) return (_mmProvider = eth);
-    if (eth) return (_mmProvider = eth); // last resort: whatever injected
-    throw new Error("MetaMask not found — install or enable the MetaMask extension");
+    // 3) Bare window.ethereum if it's genuinely MetaMask.
+    if (_isMM(eth)) return (_mmProvider = eth);
+    // No MetaMask. Don't silently use another wallet — GenLayer needs MM's snap.
+    const names = wallets.map((w) => w.name).filter((n) => n && n !== "?");
+    throw new Error("MetaMask not detected" + (names.length ? " (found: " + [...new Set(names)].join(", ") + ")" : "") + ". GenLayer needs MetaMask — enable it & disable other wallets, then retry.");
   }
   window.GL_getProvider = getMetaMaskProvider; // exposed for the app's reconnect
+  window.GL_discoverWallets = discoverWallets; // exposed for quick debugging
 
   // Some MetaMask + genlayer-js/viem combinations throw a RangeError
   // ("Maximum call stack size exceeded") while formatting an error against the
