@@ -537,17 +537,43 @@
     throw lastErr;
   });
 
+  // Some MetaMask + genlayer-js/viem combinations throw a RangeError
+  // ("Maximum call stack size exceeded") while formatting an error against the
+  // huge GenLayer chain ABI. Translate that noise into a clear, actionable msg.
+  const cleanErr = (e) => {
+    const m = (e && e.message) || String(e);
+    if (/maximum call stack|call stack size/i.test(m)) {
+      return new Error("wallet/network handshake failed — make sure MetaMask is unlocked and try again");
+    }
+    return e instanceof Error ? e : new Error(m);
+  };
+
+  // Build + connect the write client (network switch + GenLayer snap). Kept
+  // SEPARATE from address acquisition and lazy so a failure here never blocks
+  // connecting or reading the dashboard — only writes need it.
+  async function ensureWriteClient() {
+    if (!account) throw new Error("not connected");
+    if (!writeClient) {
+      writeClient = createClient({ chain: testnetAsimov, account, provider: window.ethereum });
+    }
+    // Adds the network if missing + installs the snap; harmless if already set.
+    try { await writeClient.connect("testnetAsimov"); } catch (e) { /* already on chain / snap present */ }
+    return writeClient;
+  }
+
   window.GL = {
     ready: true,
     get account() { return account; },
 
     async connect() {
       if (!window.ethereum) throw new Error("MetaMask not found");
+      // Connecting only needs the address — get it first so the dashboard can
+      // always connect and read, even if the write-client/snap setup chokes.
       const accs = await window.ethereum.request({ method: "eth_requestAccounts" });
       account = accs[0];
-      writeClient = createClient({ chain: testnetAsimov, account, provider: window.ethereum });
-      // Switch MetaMask to GenLayer Asimov (adds the network if missing)
-      try { await writeClient.connect("testnetAsimov"); } catch (e) { /* user may already be on chain */ }
+      // Best-effort write-client setup; never fatal to connect (writes build it
+      // lazily via ensureWriteClient, so a hiccup here can't fail the connect).
+      try { await ensureWriteClient(); } catch (e) { console.warn("[genote] write client deferred:", (e && e.message) || e); }
       return account;
     },
 
@@ -583,27 +609,36 @@
     },
 
     async submit(content) {
-      const hash = await writeClient.writeContract({
-        address: CONTRACT, functionName: "submit", args: [content], value: 0n,
-      });
-      await writeClient.waitForTransactionReceipt({ hash, status: TransactionStatus.ACCEPTED });
-      return hash;
+      try {
+        const wc = await ensureWriteClient();
+        const hash = await wc.writeContract({
+          address: CONTRACT, functionName: "submit", args: [content], value: 0n,
+        });
+        await wc.waitForTransactionReceipt({ hash, status: TransactionStatus.ACCEPTED });
+        return hash;
+      } catch (e) { throw cleanErr(e); }
     },
 
     async deleteEntry(index) {
-      const hash = await writeClient.writeContract({
-        address: CONTRACT, functionName: "delete_entry", args: [index], value: 0n,
-      });
-      await writeClient.waitForTransactionReceipt({ hash, status: TransactionStatus.ACCEPTED });
-      return hash;
+      try {
+        const wc = await ensureWriteClient();
+        const hash = await wc.writeContract({
+          address: CONTRACT, functionName: "delete_entry", args: [index], value: 0n,
+        });
+        await wc.waitForTransactionReceipt({ hash, status: TransactionStatus.ACCEPTED });
+        return hash;
+      } catch (e) { throw cleanErr(e); }
     },
 
     async registerAlias(name) {
-      const hash = await writeClient.writeContract({
-        address: CONTRACT, functionName: "register_alias", args: [name], value: 0n,
-      });
-      await writeClient.waitForTransactionReceipt({ hash, status: TransactionStatus.ACCEPTED });
-      return hash;
+      try {
+        const wc = await ensureWriteClient();
+        const hash = await wc.writeContract({
+          address: CONTRACT, functionName: "register_alias", args: [name], value: 0n,
+        });
+        await wc.waitForTransactionReceipt({ hash, status: TransactionStatus.ACCEPTED });
+        return hash;
+      } catch (e) { throw cleanErr(e); }
     },
   };
 
